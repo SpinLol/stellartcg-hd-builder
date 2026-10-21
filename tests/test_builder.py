@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 from PIL import Image
@@ -24,6 +25,9 @@ class Store:
 
 class BuilderTests(unittest.TestCase):
     def setUp(self):
+        self.summary = patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""})
+        self.summary.start()
+        self.addCleanup(self.summary.stop)
         self.key = Ed25519PrivateKey.generate()
         self.pem = self.key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
         out = io.BytesIO()
@@ -75,3 +79,4 @@ class BuilderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
