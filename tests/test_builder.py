@@ -3,11 +3,12 @@ import io
 import json
 import os
 import unittest
+import urllib.error
 from unittest.mock import patch
 from PIL import Image
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from builder import build, digest, encoded, render, POLICY, printing_url, high_resolution, artwork_signature
+from builder import build, digest, encoded, render, POLICY, printing_url, high_resolution, artwork_signature, alternate_printing
 
 
 class Store:
@@ -85,7 +86,7 @@ class BuilderTests(unittest.TestCase):
     def test_higher_scan_must_match_existing_artwork(self):
         reference=artwork_signature(self.original)[0]
         out=io.BytesIO();Image.new("RGB",(600,1000),(200,30,20)).save(out,"PNG")
-        row={"remote":"https://images.pokemontcg.io/sv3pt5/1_hires.png","reference_dhash":reference,"minimum_dimension":256}
+        row={"remote":"https://images.pokemontcg.io/sv3pt5/1_hires.png","printing_id":"sv3pt5-1","reference_dhash":reference,"minimum_dimension":256}
         with patch("builder.remote",return_value=out.getvalue()):
             self.assertIsNotNone(high_resolution(row))
         wrong=Image.new("L",(900,800));wrong.putdata([255-int(x/899*255) for y in range(800) for x in range(900)]);out=io.BytesIO();wrong.save(out,"PNG")
@@ -99,6 +100,22 @@ class BuilderTests(unittest.TestCase):
         report=build(self.store,"preview",self.pem)
         self.assertEqual(0,report["generated"])
         self.assertEqual(2,report["standard_fallbacks"])
+
+    def test_newer_printing_uses_verified_equivalent_provider_id(self):
+        printing={"source_card_id":"me3-1","name":"Spinarak"}
+        alternate=alternate_printing(printing)
+        self.assertEqual("me03-001",alternate["id"])
+        self.assertIsNone(alternate_printing({"source_card_id":"unknown-1","name":"Spinarak"}))
+        out=io.BytesIO();Image.new("RGB",(600,825),(200,30,20)).save(out,"PNG")
+        row={"remote":"https://images.pokemontcg.io/me3/1_hires.png","printing_id":"me3-1","alternate":alternate,"reference_dhash":artwork_signature(self.original)[0],"minimum_dimension":256}
+        details={"id":"me03-001","name":"Spinarak","image":"https://assets.tcgdex.net/en/me/me03/001"}
+        def fetch(url,maximum=32<<20):
+            if "pokemontcg.io" in url:raise urllib.error.HTTPError(url,404,"Not found",{},None)
+            return encoded(details) if "api.tcgdex" in url else out.getvalue()
+        with patch("builder.remote",side_effect=fetch):
+            self.assertIsNotNone(high_resolution(row))
+            details["name"]="Different card"
+            with self.assertRaises(ValueError):high_resolution(row)
 
     def test_interrupted_large_build_resumes_checkpoint_without_reprocessing(self):
         source=json.loads(self.store.get("sources","channels/preview.json"))

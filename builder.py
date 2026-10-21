@@ -138,16 +138,43 @@ def artwork_signature(data):
         return f"{value:016x}", max(raw.size)
 
 
+def alternate_printing(printing):
+    """Known equivalent provider set IDs, never a fuzzy search for another printing."""
+    identifier = printing.get("source_card_id", "")
+    if not re.fullmatch(r"me(?:1|2|2pt5|3|4|5)-[0-9]+", identifier):
+        return None
+    set_id, number = identifier.rsplit("-", 1)
+    sets = {"me1": "me01", "me2": "me02", "me2pt5": "me02.5", "me3": "me03", "me4": "me04", "me5": "me05"}
+    name = printing.get("name", "").strip()
+    if not name:
+        return None
+    equivalent = sets[set_id] + "-" + number.zfill(3)
+    return {"url": "https://api.tcgdex.net/v2/en/cards/" + equivalent, "id": equivalent, "name": name}
+
+
 def high_resolution(row):
     url = row.get("remote")
     if not url:
         return None
-    if url.startswith("https://api.tcgdex.net/"):
-        details = json.loads(remote(url, 1 << 20))
-        if details.get("id") != row["printing_id"] or not details.get("image", "").startswith("https://assets.tcgdex.net/"):
-            raise ValueError("Provider printing ID mismatch")
-        url = details["image"] + "/high.webp"
-    data = remote(url)
+    def scan(address, identifier, name=None):
+        if address.startswith("https://api.tcgdex.net/"):
+            details = json.loads(remote(address, 1 << 20))
+            if details.get("id") != identifier or name and details.get("name", "").strip().casefold() != name.strip().casefold():
+                raise ValueError("Provider printing ID or name mismatch")
+            image = details.get("image") or ""
+            if not image:
+                raise ValueError("Provider has no image for this printing")
+            if not image.startswith("https://assets.tcgdex.net/"):
+                raise ValueError("Untrusted provider image URL")
+            address = image + "/high.webp"
+        return remote(address)
+    try:
+        data = scan(url, row["printing_id"])
+    except urllib.error.HTTPError as missing:
+        alternative = row.get("alternate")
+        if missing.code != 404 or not alternative:
+            raise
+        data = scan(alternative["url"], alternative["id"], alternative["name"])
     signature, dimension = artwork_signature(data)
     if (int(signature, 16) ^ int(row["reference_dhash"], 16)).bit_count() > 16:
         raise ValueError("Higher-resolution scan does not match the configured artwork")
@@ -256,6 +283,9 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
         item = {"source": uploaded_hash, "original_sha256": h, "mode": row["mode"], "trim": bool(row["trim"]), "minimum_dimension": minimum}
         if url:
             item.update(remote=url, printing_id=row["printing"]["source_card_id"], reference_dhash=signature)
+            alternative = alternate_printing(row["printing"])
+            if alternative:
+                item["alternate"] = alternative
         rows[logical] = item
         if len(rows) % 500 == 0:
             print(json.dumps({"phase": "source_metadata", "processed": len(rows), "total": len(document["assets"]), "new_originals": uploaded}), flush=True)
