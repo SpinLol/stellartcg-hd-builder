@@ -1,0 +1,7 @@
+private/
+*.pem
+*.env
+*credentials*
+*source-export*
+__pycache__/
+output/
