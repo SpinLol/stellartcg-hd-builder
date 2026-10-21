@@ -100,6 +100,29 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(0,report["generated"])
         self.assertEqual(2,report["standard_fallbacks"])
 
+    def test_interrupted_large_build_resumes_checkpoint_without_reprocessing(self):
+        source=json.loads(self.store.get("sources","channels/preview.json"))
+        row=next(iter(source["assets"].values()))
+        source["assets"]={f"stellartcg:atlas/{i:03}":dict(row,test_index=i) for i in range(110)}
+        self.store.put("sources","channels/preview.json",encoded(source))
+        image=render(self.original)
+        actual_get=self.store.get
+        calls=0
+        def interrupted(bucket,key,maximum=32 << 20):
+            nonlocal calls
+            if key.startswith("sources/"):
+                calls+=1
+                if calls==104:raise OSError("Interrupted test build")
+            return actual_get(bucket,key,maximum)
+        with patch.object(self.store,"get",side_effect=interrupted),patch("builder.render",return_value=image):
+            with self.assertRaises(OSError):build(self.store,"preview",self.pem,workers=1)
+        self.assertIsNone(actual_get("finished","channels/preview.json"))
+        self.assertEqual(100,len(json.loads(actual_get("finished","indexes/preview.json"))))
+        with patch("builder.render",return_value=image) as renderer:
+            report=build(self.store,"preview",self.pem)
+        self.assertEqual(100,report["reused"])
+        self.assertEqual(10,renderer.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,10 @@ import re
 import warnings
 import urllib.request
 import urllib.parse
+import urllib.error
 import zipfile
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from PIL import Image, ImageOps
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -85,10 +88,21 @@ def remote(url, maximum=MAX_SOURCE):
     if parsed.scheme != "https" or parsed.hostname not in {"images.pokemontcg.io", "api.tcgdex.net", "assets.tcgdex.net"} or parsed.port or parsed.username or parsed.password or parsed.fragment or parsed.query:
         raise ValueError("Untrusted high-resolution artwork provider")
     request = urllib.request.Request(url, headers={"User-Agent": "StellarTCG-ArtworkPublisher/2", "Accept": "application/json,image/webp,image/png"})
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
-        if int(response.headers.get("Content-Length", "0")) > maximum:
-            raise ValueError("Provider image exceeds limit")
-        result = response.read(maximum + 1)
+    for attempt in range(3):
+        try:
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
+                if int(response.headers.get("Content-Length", "0")) > maximum:
+                    raise ValueError("Provider image exceeds limit")
+                result = response.read(maximum + 1)
+            break
+        except urllib.error.HTTPError as failure:
+            if failure.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+        except (TimeoutError, urllib.error.URLError):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
     if len(result) > maximum:
         raise ValueError("Provider image exceeds limit")
     return result
@@ -253,7 +267,27 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
     print(json.dumps({"source_textures": len(rows), "new_originals": uploaded, "source_catalog_sha256": digest(data)}))
 
 
-def build(store, name, signing_key, budget=8 << 30, retry_missing=False):
+def prepare_asset(store, row):
+    """One bounded worker: fetch and encode in RAM; the coordinator alone publishes."""
+    original = None
+    if row.get("remote"):
+        try:
+            original = high_resolution(row)
+        except Exception as failure:
+            print(json.dumps({"printing": row.get("printing_id", ""), "standard_fallback_reason": str(failure)[:180]}), flush=True)
+    if original is None and row.get("source"):
+        original = store.get(store.sources, f"sources/{row['source']}", MAX_SOURCE)
+        if original is None or digest(original) != row["source"]:
+            raise ValueError("Missing or corrupt original; published catalog unchanged")
+    if original is None or artwork_signature(original)[1] <= row.get("minimum_dimension", 256):
+        return {"skipped": True}, None
+    image = render(original, row["mode"], row["trim"])
+    with Image.open(io.BytesIO(image)) as rendered:
+        dimensions = rendered.size
+    return {"sha256": digest(image), "bytes": len(image), "width": dimensions[0], "height": dimensions[1]}, image
+
+
+def build(store, name, signing_key, budget=8 << 30, retry_missing=False, workers=4):
     source = store.get(store.sources, f"channels/{channel(name)}.json")
     if source is None:
         raise ValueError("Upload a source catalog first")
@@ -267,50 +301,72 @@ def build(store, name, signing_key, budget=8 << 30, retry_missing=False):
     used = sum(existing.values()) + sum(store.objects(store.sources).values())
     index_bytes = store.get(store.output, f"indexes/{name}.json")
     previous = json.loads(index_bytes) if index_bytes else {}
-    index, assets, generated, reused, skipped = {}, {}, 0, 0, 0
-    for processed, (logical, row) in enumerate(sorted(data["assets"].items()), 1):
-        if processed % 100 == 0:
-            print(json.dumps({"phase": "native_hd_scans", "processed": processed, "total": len(data["assets"]), "generated": generated, "reused": reused, "standard_fallbacks": skipped}), flush=True)
+    if not 1 <= workers <= 4:
+        raise ValueError("HD worker count must be 1..4")
+    index, assets, generated, reused, skipped, processed, checkpoint = {}, {}, 0, 0, 0, 0, 0
+    groups = {}
+    for logical, row in sorted(data["assets"].items()):
         if not LOGICAL.fullmatch(logical) or ".." in logical or row.get("source") and not HASH.fullmatch(row["source"]):
             raise ValueError("Invalid source catalog row")
         fingerprint = digest(encoded([POLICY, row]))
-        asset = index.get(fingerprint, previous.get(fingerprint))
-        if asset and asset.get("skipped") and not retry_missing:
-            index[fingerprint] = asset
-            skipped += 1
-            continue
-        if asset and not asset.get("skipped") and existing.get(f"objects/{asset['sha256']}.webp") == asset["bytes"]:
-            reused += 1
+        if fingerprint not in groups:
+            groups[fingerprint] = (row, [])
+        groups[fingerprint][1].append(logical)
+
+    def commit_result(fingerprint, logicals, asset, image):
+        nonlocal used, generated, reused, skipped, processed, checkpoint
+        if asset.get("skipped"):
+            skipped += len(logicals)
         else:
-            original = None
-            if row.get("remote"):
-                try:
-                    original = high_resolution(row)
-                except Exception as failure:
-                    print(json.dumps({"printing": row.get("printing_id", ""), "standard_fallback_reason": str(failure)[:180]}))
-                    original = None
-            if original is None and row.get("source"):
-                original = store.get(store.sources, f"sources/{row['source']}", MAX_SOURCE)
-                if original is None or digest(original) != row["source"]:
-                    raise ValueError("Missing or corrupt original; published catalog unchanged")
-            if original is None or artwork_signature(original)[1] <= row.get("minimum_dimension", 256):
-                index[fingerprint] = {"skipped": True}
-                skipped += 1
-                continue
-            image = render(original, row["mode"], row["trim"])
-            with Image.open(io.BytesIO(image)) as rendered:
-                dimensions = rendered.size
-            asset = {"sha256": digest(image), "bytes": len(image), "width": dimensions[0], "height": dimensions[1]}
             key = f"objects/{asset['sha256']}.webp"
-            if key not in existing:
+            if image is not None and key not in existing:
                 if used + len(image) > budget:
                     raise ValueError("R2 storage safety budget exceeded; published catalog unchanged")
                 store.put(store.output, key, image, True)
                 existing[key] = len(image)
                 used += len(image)
-            generated += 1
+            if image is not None:
+                generated += 1
+                reused += len(logicals) - 1
+            else:
+                reused += len(logicals)
+            for logical in logicals:
+                assets[logical] = asset
         index[fingerprint] = asset
-        assets[logical] = asset
+        processed += len(logicals)
+        if processed - checkpoint >= 100:
+            store.put(store.output, f"indexes/{name}.json", encoded({**previous, **index}))
+            checkpoint = processed
+            print(json.dumps({"phase": "native_hd_scans", "processed": processed, "total": len(data["assets"]), "generated": generated, "reused": reused, "standard_fallbacks": skipped}), flush=True)
+
+    queue = []
+    for fingerprint, (row, logicals) in groups.items():
+        asset = previous.get(fingerprint)
+        if asset and asset.get("skipped") and not retry_missing:
+            commit_result(fingerprint, logicals, asset, None)
+        elif asset and not asset.get("skipped") and existing.get(f"objects/{asset['sha256']}.webp") == asset["bytes"]:
+            commit_result(fingerprint, logicals, asset, None)
+        else:
+            queue.append((fingerprint, row, logicals))
+    # At most four in-flight image buffers; never submit the whole catalog as image futures.
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="native-hd")
+    iterator, pending = iter(queue), {}
+    def submit():
+        item = next(iterator, None)
+        if item is not None:
+            fingerprint, row, logicals = item
+            pending[executor.submit(prepare_asset, store, row)] = (fingerprint, logicals)
+    try:
+        for unused in range(workers): submit()
+        while pending:
+            completed, unused = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                fingerprint, logicals = pending.pop(future)
+                asset, image = future.result()
+                commit_result(fingerprint, logicals, asset, image)
+                submit()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
     payload = encoded({"format": 1, "policy": POLICY, "content_hash": data["content_hash"], "assets": assets})
     envelope = encoded({"payload": base64.b64encode(payload).decode(), "signature": base64.b64encode(private.sign(payload)).decode()})
     if len(envelope) > 48 << 20:
@@ -343,6 +399,7 @@ def main():
     parser.add_argument("--source-export")
     parser.add_argument("--content-root", help="Override the exported server config root, for a copied content directory")
     parser.add_argument("--retry-missing", action="store_true", help="Recheck provider scans that were unavailable or rejected previously")
+    parser.add_argument("--workers", type=int, default=4, choices=range(1,5))
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--maximum-storage-gib", type=float, default=8)
     args = parser.parse_args()
@@ -362,7 +419,7 @@ def main():
     if args.operation == "sources":
         publish_sources(store, args.source_export, args.channel, args.limit, budget, args.content_root)
     else:
-        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget, args.retry_missing)
+        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget, args.retry_missing, args.workers)
 
 
 if __name__ == "__main__":
