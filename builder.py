@@ -13,6 +13,9 @@ import os
 from pathlib import Path
 import re
 import warnings
+import urllib.request
+import urllib.parse
+import zipfile
 from PIL import Image, ImageOps
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -20,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 MAX_SOURCE = 32 * 1024 * 1024
 MAX_CATALOG = 32 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 16_777_216
-POLICY = "hd2048-webp95-lanczos-v1"
+POLICY = "native-hd-max2048-webp95-no-upscale-v2"
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 LOGICAL = re.compile(r"stellartcg:[a-z0-9_./-]{1,180}\Z")
 
@@ -54,20 +57,100 @@ def render(source, mode="contain", trim=False):
         bounds = image.getchannel("A").getbbox()
         if bounds:
             image = image.crop(bounds)
+    maximum = min(2048, max(image.size))
     if mode == "contain":
-        scale = min(2048 / image.width, 2048 / image.height)
+        scale = min(1, 2048 / image.width, 2048 / image.height)
         size = (max(1, int(image.width * scale + .5)), max(1, int(image.height * scale + .5)))
         resized = image.resize(size, Image.Resampling.LANCZOS)
-        canvas = Image.new("RGBA", (2048, 2048))
-        canvas.paste(resized, ((2048 - size[0]) // 2, (2048 - size[1]) // 2))
+        canvas = Image.new("RGBA", (maximum, maximum))
+        canvas.paste(resized, ((maximum - size[0]) // 2, (maximum - size[1]) // 2))
     elif mode in ("fill", "stretch"):
         # Physical product UVs already encode proportions; preserve the server's face policy.
-        canvas = image.resize((2048, 2048), Image.Resampling.LANCZOS)
+        scale = min(1, 2048 / image.width, 2048 / image.height)
+        canvas = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
     else:
         raise ValueError("Unknown layout mode")
     output = io.BytesIO()
     canvas.save(output, "WEBP", quality=95, method=6, exact=True)
     return output.getvalue()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        raise ValueError("Artwork providers must not redirect downloads")
+
+
+def remote(url, maximum=MAX_SOURCE):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"images.pokemontcg.io", "api.tcgdex.net", "assets.tcgdex.net"} or parsed.port or parsed.username or parsed.password or parsed.fragment or parsed.query:
+        raise ValueError("Untrusted high-resolution artwork provider")
+    request = urllib.request.Request(url, headers={"User-Agent": "StellarTCG-ArtworkPublisher/2", "Accept": "application/json,image/webp,image/png"})
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
+        if int(response.headers.get("Content-Length", "0")) > maximum:
+            raise ValueError("Provider image exceeds limit")
+        result = response.read(maximum + 1)
+    if len(result) > maximum:
+        raise ValueError("Provider image exceeds limit")
+    return result
+
+
+def printing_url(printing):
+    identifier = printing.get("source_card_id", "")
+    source = printing.get("metadata_source", "")
+    image = printing.get("image_source", "")
+    if image.startswith("https://images.pokemontcg.io/"):
+        return image if "_hires." in image else image.rsplit(".", 1)[0] + "_hires.png"
+    if image.startswith("https://assets.tcgdex.net/"):
+        return re.sub(r"/(?:low|high)\.(?:png|webp|jpg)$", "/high.webp", image)
+    if source.startswith("https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/") and re.fullmatch(r"[a-z0-9.]+-[A-Za-z0-9]+", identifier):
+        set_id, number = identifier.rsplit("-", 1)
+        if source.endswith("/" + set_id + ".json"):
+            return f"https://images.pokemontcg.io/{set_id}/{number}_hires.png"
+    if source.startswith("https://api.tcgdex.net/v2/en/cards/") and source.rsplit("/", 1)[-1] == identifier:
+        return source
+    return None
+
+
+def artwork_signature(data):
+    with Image.open(io.BytesIO(data)) as raw:
+        if raw.width * raw.height > Image.MAX_IMAGE_PIXELS or getattr(raw, "n_frames", 1) != 1:
+            raise ValueError("Unsafe reference image")
+        image = ImageOps.exif_transpose(raw).convert("RGBA")
+        bounds = image.getchannel("A").getbbox()
+        if bounds:
+            image = image.crop(bounds)
+        image = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+        value = sum((1 << (y * 8 + x)) for y in range(8) for x in range(8) if image.getpixel((x, y)) > image.getpixel((x+1, y)))
+        return f"{value:016x}", max(raw.size)
+
+
+def high_resolution(row):
+    url = row.get("remote")
+    if not url:
+        return None
+    if url.startswith("https://api.tcgdex.net/"):
+        details = json.loads(remote(url, 1 << 20))
+        if details.get("id") != row["printing_id"] or not details.get("image", "").startswith("https://assets.tcgdex.net/"):
+            raise ValueError("Provider printing ID mismatch")
+        url = details["image"] + "/high.webp"
+    data = remote(url)
+    signature, dimension = artwork_signature(data)
+    if (int(signature, 16) ^ int(row["reference_dhash"], 16)).bit_count() > 16:
+        raise ValueError("Higher-resolution scan does not match the configured artwork")
+    if dimension <= row.get("minimum_dimension", 256):
+        return None
+    return data
+
+
+def source_bytes(path, row):
+    if row.get("archive"):
+        with zipfile.ZipFile(path) as archive:
+            if archive.getinfo(row["entry"]).file_size > MAX_SOURCE:
+                raise ValueError("Source face exceeds byte limit")
+            return archive.read(row["entry"])
+    if path.stat().st_size > MAX_SOURCE:
+        raise ValueError("Original exceeds byte limit")
+    return path.read_bytes()
 
 
 class R2:
@@ -111,7 +194,7 @@ class R2:
         return result
 
 
-def publish_sources(store, file, name, limit=0, budget=8 << 30):
+def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=None):
     """Stream unchanged originals directly to a PRIVATE bucket; no HD encoding here."""
     document = json.loads(Path(file).read_text(encoding="utf-8-sig"))
     if document.get("format") != 1 or len(document["assets"]) > 200000:
@@ -121,28 +204,45 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30):
     existing = store.objects(store.sources)
     used = sum(existing.values()) + sum(store.objects(store.output).values())
     rows, seen, uploaded = {}, {}, 0
+    root = Path(content_root or document.get("content_root", Path(file).parent)).resolve()
     for logical, row in sorted(document["assets"].items()):
         if not LOGICAL.fullmatch(logical) or ".." in logical:
             raise ValueError("Invalid logical ID")
         if limit and len(rows) >= limit:
             break
-        path = Path(row["file"])
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SOURCE:
+        path = (root / row.get("file", row.get("archive", ""))).resolve()
+        if not path.is_relative_to(root) or path.is_symlink() or not path.is_file():
             raise ValueError("Invalid original source file")
         # File paths never leave this machine. Source catalog contains hashes only.
-        if str(path) not in seen:
-            data = path.read_bytes()
+        identity = str(path) + "|" + row.get("entry", "")
+        data = None
+        if identity not in seen:
+            data = source_bytes(path, row)
             h = digest(data)
+            signature, dimension = artwork_signature(data)
+            seen[identity] = (h, signature, dimension)
+        h, signature, dimension = seen[identity]
+        minimum = row.get("minimum_dimension", 256)
+        url = printing_url(row.get("printing", {}))
+        uploaded_hash = ""
+        if not url or dimension > minimum:
             key = f"sources/{h}"
             if key not in existing:
+                if data is None:
+                    data = source_bytes(path, row)
+                if digest(data) != h:
+                    raise ValueError("Original changed during upload; source channel unchanged")
                 if used + len(data) > budget:
                     raise ValueError("R2 storage safety budget exceeded; source channel unchanged")
                 store.put(store.sources, key, data, True)
                 existing[key] = len(data)
                 used += len(data)
                 uploaded += 1
-            seen[str(path)] = h
-        rows[logical] = {"source": seen[str(path)], "mode": row["mode"], "trim": bool(row["trim"])}
+            uploaded_hash = h
+        item = {"source": uploaded_hash, "original_sha256": h, "mode": row["mode"], "trim": bool(row["trim"]), "minimum_dimension": minimum}
+        if url:
+            item.update(remote=url, printing_id=row["printing"]["source_card_id"], reference_dhash=signature)
+        rows[logical] = item
     catalog = {"format": 1, "policy": POLICY, "content_hash": document["content_hash"], "assets": rows}
     data = encoded(catalog)
     if len(data) > MAX_CATALOG:
@@ -151,7 +251,7 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30):
     print(json.dumps({"source_textures": len(rows), "new_originals": uploaded, "source_catalog_sha256": digest(data)}))
 
 
-def build(store, name, signing_key, budget=8 << 30):
+def build(store, name, signing_key, budget=8 << 30, retry_missing=False):
     source = store.get(store.sources, f"channels/{channel(name)}.json")
     if source is None:
         raise ValueError("Upload a source catalog first")
@@ -165,20 +265,38 @@ def build(store, name, signing_key, budget=8 << 30):
     used = sum(existing.values()) + sum(store.objects(store.sources).values())
     index_bytes = store.get(store.output, f"indexes/{name}.json")
     previous = json.loads(index_bytes) if index_bytes else {}
-    index, assets, generated, reused = {}, {}, 0, 0
+    index, assets, generated, reused, skipped = {}, {}, 0, 0, 0
     for logical, row in sorted(data["assets"].items()):
-        if not LOGICAL.fullmatch(logical) or ".." in logical or not HASH.fullmatch(row["source"]):
+        if not LOGICAL.fullmatch(logical) or ".." in logical or row.get("source") and not HASH.fullmatch(row["source"]):
             raise ValueError("Invalid source catalog row")
         fingerprint = digest(encoded([POLICY, row]))
         asset = index.get(fingerprint, previous.get(fingerprint))
-        if asset and existing.get(f"objects/{asset['sha256']}.webp") == asset["bytes"]:
+        if asset and asset.get("skipped") and not retry_missing:
+            index[fingerprint] = asset
+            skipped += 1
+            continue
+        if asset and not asset.get("skipped") and existing.get(f"objects/{asset['sha256']}.webp") == asset["bytes"]:
             reused += 1
         else:
-            original = store.get(store.sources, f"sources/{row['source']}", MAX_SOURCE)
-            if original is None or digest(original) != row["source"]:
-                raise ValueError("Missing or corrupt original; published catalog unchanged")
+            original = None
+            if row.get("remote"):
+                try:
+                    original = high_resolution(row)
+                except Exception as failure:
+                    print(json.dumps({"printing": row.get("printing_id", ""), "standard_fallback_reason": str(failure)[:180]}))
+                    original = None
+            if original is None and row.get("source"):
+                original = store.get(store.sources, f"sources/{row['source']}", MAX_SOURCE)
+                if original is None or digest(original) != row["source"]:
+                    raise ValueError("Missing or corrupt original; published catalog unchanged")
+            if original is None or artwork_signature(original)[1] <= row.get("minimum_dimension", 256):
+                index[fingerprint] = {"skipped": True}
+                skipped += 1
+                continue
             image = render(original, row["mode"], row["trim"])
-            asset = {"sha256": digest(image), "bytes": len(image), "width": 2048, "height": 2048}
+            with Image.open(io.BytesIO(image)) as rendered:
+                dimensions = rendered.size
+            asset = {"sha256": digest(image), "bytes": len(image), "width": dimensions[0], "height": dimensions[1]}
             key = f"objects/{asset['sha256']}.webp"
             if key not in existing:
                 if used + len(image) > budget:
@@ -201,7 +319,7 @@ def build(store, name, signing_key, budget=8 << 30):
     if old and old != envelope:
         store.put(store.output, f"channels/{name}-previous.json", old)
     store.put(store.output, f"channels/{name}.json", envelope)
-    report = {"logical_textures": len(assets), "generated": generated, "reused": reused,
+    report = {"logical_textures": len(assets), "generated": generated, "reused": reused, "standard_fallbacks": skipped,
               "unique_hd_bytes": sum(existing.get(k, 0) for k in {f"objects/{a['sha256']}.webp" for a in assets.values()}),
               "combined_bucket_bytes": used, "revision": revision, "channel": name}
     print(json.dumps(report, indent=2))
@@ -219,6 +337,8 @@ def main():
     parser.add_argument("--output-bucket", default=os.environ.get("R2_OUTPUT_BUCKET", "stellartcg-hd"))
     parser.add_argument("--channel", default="preview", type=channel)
     parser.add_argument("--source-export")
+    parser.add_argument("--content-root", help="Override the exported server config root, for a copied content directory")
+    parser.add_argument("--retry-missing", action="store_true", help="Recheck provider scans that were unavailable or rejected previously")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--maximum-storage-gib", type=float, default=8)
     args = parser.parse_args()
@@ -236,9 +356,9 @@ def main():
     store = R2(args.account, args.sources_bucket, args.output_bucket)
     budget = int(args.maximum_storage_gib * (1 << 30))
     if args.operation == "sources":
-        publish_sources(store, args.source_export, args.channel, args.limit, budget)
+        publish_sources(store, args.source_export, args.channel, args.limit, budget, args.content_root)
     else:
-        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget)
+        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget, args.retry_missing)
 
 
 if __name__ == "__main__":

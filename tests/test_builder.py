@@ -7,7 +7,7 @@ from unittest.mock import patch
 from PIL import Image
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from builder import build, digest, encoded, render, POLICY
+from builder import build, digest, encoded, render, POLICY, printing_url, high_resolution, artwork_signature
 
 
 class Store:
@@ -42,9 +42,9 @@ class BuilderTests(unittest.TestCase):
         data = render(self.original)
         self.assertEqual(data, render(self.original))
         with Image.open(io.BytesIO(data)) as image:
-            self.assertEqual((2048, 2048), image.size)
+            self.assertEqual((500, 500), image.size)
             self.assertEqual(0, image.getpixel((0, 100))[3])
-            self.assertEqual(255, image.getpixel((1024, 1024))[3])
+            self.assertEqual(255, image.getpixel((250, 250))[3])
 
     def test_publish_is_signed_deduplicated_and_incremental(self):
         first = build(self.store, "preview", self.pem)
@@ -76,7 +76,30 @@ class BuilderTests(unittest.TestCase):
         with self.assertRaises(Exception):
             render(b"not an image")
 
+    def test_exact_printing_resolves_without_guessing_another_set(self):
+        printing={"source_card_id":"sv3pt5-1","metadata_source":"https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master/cards/en/sv3pt5.json"}
+        self.assertEqual("https://images.pokemontcg.io/sv3pt5/1_hires.png",printing_url(printing))
+        printing["metadata_source"]="https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master/cards/en/sv1.json"
+        self.assertIsNone(printing_url(printing))
+
+    def test_higher_scan_must_match_existing_artwork(self):
+        reference=artwork_signature(self.original)[0]
+        out=io.BytesIO();Image.new("RGB",(600,1000),(200,30,20)).save(out,"PNG")
+        row={"remote":"https://images.pokemontcg.io/sv3pt5/1_hires.png","reference_dhash":reference,"minimum_dimension":256}
+        with patch("builder.remote",return_value=out.getvalue()):
+            self.assertIsNotNone(high_resolution(row))
+        wrong=Image.new("L",(900,800));wrong.putdata([255-int(x/899*255) for y in range(800) for x in range(900)]);out=io.BytesIO();wrong.save(out,"PNG")
+        with patch("builder.remote",return_value=out.getvalue()):
+            with self.assertRaises(ValueError): high_resolution(row)
+
+    def test_low_resolution_does_not_get_fabricated_hd(self):
+        source=json.loads(self.store.get("sources","channels/preview.json"))
+        for row in source["assets"].values():row["minimum_dimension"]=512
+        self.store.put("sources","channels/preview.json",encoded(source))
+        report=build(self.store,"preview",self.pem)
+        self.assertEqual(0,report["generated"])
+        self.assertEqual(2,report["standard_fallbacks"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
