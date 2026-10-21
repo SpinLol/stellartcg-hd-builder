@@ -225,7 +225,7 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
         minimum = row.get("minimum_dimension", 256)
         url = printing_url(row.get("printing", {}))
         uploaded_hash = ""
-        if not url or dimension > minimum:
+        if dimension > minimum:
             key = f"sources/{h}"
             if key not in existing:
                 if data is None:
@@ -243,6 +243,8 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
         if url:
             item.update(remote=url, printing_id=row["printing"]["source_card_id"], reference_dhash=signature)
         rows[logical] = item
+        if len(rows) % 500 == 0:
+            print(json.dumps({"phase": "source_metadata", "processed": len(rows), "total": len(document["assets"]), "new_originals": uploaded}), flush=True)
     catalog = {"format": 1, "policy": POLICY, "content_hash": document["content_hash"], "assets": rows}
     data = encoded(catalog)
     if len(data) > MAX_CATALOG:
@@ -266,7 +268,9 @@ def build(store, name, signing_key, budget=8 << 30, retry_missing=False):
     index_bytes = store.get(store.output, f"indexes/{name}.json")
     previous = json.loads(index_bytes) if index_bytes else {}
     index, assets, generated, reused, skipped = {}, {}, 0, 0, 0
-    for logical, row in sorted(data["assets"].items()):
+    for processed, (logical, row) in enumerate(sorted(data["assets"].items()), 1):
+        if processed % 100 == 0:
+            print(json.dumps({"phase": "native_hd_scans", "processed": processed, "total": len(data["assets"]), "generated": generated, "reused": reused, "standard_fallbacks": skipped}), flush=True)
         if not LOGICAL.fullmatch(logical) or ".." in logical or row.get("source") and not HASH.fullmatch(row["source"]):
             raise ValueError("Invalid source catalog row")
         fingerprint = digest(encoded([POLICY, row]))
