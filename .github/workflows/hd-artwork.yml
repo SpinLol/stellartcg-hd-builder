@@ -1,5 +1,8 @@
 name: Build HD artwork
 on:
+  push:
+    branches: [main]
+    paths: ['builder.py', 'requirements.txt', 'tests/**', '.github/workflows/hd-artwork.yml']
   schedule:
     - cron: '17,47 * * * *'
   workflow_dispatch:
