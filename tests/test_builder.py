@@ -8,7 +8,7 @@ from unittest.mock import patch
 from PIL import Image
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from builder import build, digest, encoded, render, POLICY, printing_url, high_resolution, artwork_signature, alternate_printing
+from builder import build, digest, encoded, render, POLICY, printing_url, high_resolution, artwork_signature, alternate_printing, publish_sources
 
 
 class Store:
@@ -22,9 +22,37 @@ class Store:
         self.writes.append((bucket, key))
     def objects(self, bucket):
         return {key: len(data) for (b, key), data in self.files.items() if b == bucket}
+    def snapshot(self, bucket, key):
+        data = self.get(bucket, key)
+        return data, digest(data) if data else None
+    def conditional(self, bucket, key, data, etag):
+        if self.snapshot(bucket, key)[1] != etag:
+            return False
+        self.put(bucket, key, data)
+        return True
 
 
 class BuilderTests(unittest.TestCase):
+    def test_source_export_preserves_custom_inbox_override_and_new_logical_ids(self):
+        import tempfile
+        from pathlib import Path
+        h = digest(self.original)
+        source = json.loads(self.store.get("sources", "channels/preview.json"))
+        manual = {"source": h, "original_sha256": h, "mode": "contain", "trim": False,
+                  "minimum_dimension": 256, "admin_upload": {"card": "stellartcg:custom/001", "sha256": h}}
+        source["assets"]["stellartcg:atlas/old"] = manual
+        self.store.put("sources", "channels/preview.json", encoded(source))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "001.png").write_bytes(self.original)
+            rows = {"stellartcg:atlas/new": {"file": "001.png", "mode": "contain", "trim": False,
+                                            "minimum_dimension": 256, "custom_card": "stellartcg:custom/001"}}
+            (root / "export.json").write_bytes(encoded({"format": 1, "content_hash": "new", "assets": rows}))
+            publish_sources(self.store, root / "export.json", "preview")
+        after = json.loads(self.store.get("sources", "channels/preview.json"))
+        self.assertEqual(after["assets"]["stellartcg:atlas/new"]["admin_upload"]["sha256"], h)
+        self.assertFalse(after["assets"]["stellartcg:atlas/new"].get("remote"))
+
     def setUp(self):
         self.summary = patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""})
         self.summary.start()
@@ -100,6 +128,52 @@ class BuilderTests(unittest.TestCase):
         report=build(self.store,"preview",self.pem)
         self.assertEqual(0,report["generated"])
         self.assertEqual(2,report["standard_fallbacks"])
+
+    def test_automatic_server_reference_uses_exact_cloud_fingerprint(self):
+        row = {"source": "", "reference_source": digest(self.original), "mode": "contain", "trim": False,
+               "minimum_dimension": 256, "printing": {"source_card_id": "sv3pt5-1",
+               "image_source": "https://images.pokemontcg.io/sv3pt5/1.png"}}
+        source = {"format": 1, "policy": POLICY, "content_hash": "added", "assets": {"stellartcg:atlas/new": row}}
+        self.store.put("sources", "channels/preview.json", encoded(source))
+        out = io.BytesIO(); Image.new("RGB", (733, 1024), (200, 30, 20)).save(out, "PNG")
+        with patch("builder.remote", return_value=out.getvalue()):
+            report = build(self.store, "preview", self.pem)
+        self.assertEqual(1, report["generated"])
+        payload = json.loads(base64.b64decode(json.loads(self.store.get("finished", "channels/preview.json"))["payload"]))
+        self.assertEqual(1024, payload["assets"]["stellartcg:atlas/new"]["width"])
+
+    def test_corrupt_server_reference_preserves_published_hd(self):
+        build(self.store, "preview", self.pem)
+        before = self.store.get("finished", "channels/preview.json")
+        row = {"source": "", "reference_source": "0" * 64, "mode": "contain", "trim": False,
+               "printing": {"source_card_id": "sv3pt5-1", "image_source": "https://images.pokemontcg.io/sv3pt5/1.png"}}
+        self.store.put("sources", "channels/preview.json", encoded({"format": 1, "policy": POLICY,
+                       "content_hash": "bad", "assets": {"stellartcg:atlas/new": row}}))
+        with self.assertRaises(ValueError): build(self.store, "preview", self.pem)
+        self.assertEqual(before, self.store.get("finished", "channels/preview.json"))
+
+    def test_scheduled_check_does_not_list_or_write_unchanged_buckets(self):
+        build(self.store, "preview", self.pem)
+        self.store.writes.clear()
+        with patch.object(self.store, "objects", side_effect=AssertionError("Unchanged scheduled check listed buckets")):
+            report = build(self.store, "preview", self.pem, only_if_changed=True)
+        self.assertTrue(report["unchanged"])
+        self.assertEqual([], self.store.writes)
+
+    def test_new_source_after_success_runs_next_scheduled_build(self):
+        build(self.store, "preview", self.pem)
+        source = json.loads(self.store.get("sources", "channels/preview.json"))
+        source["content_hash"] = "new"
+        source["assets"]["stellartcg:atlas/new"] = dict(source["assets"]["stellartcg:atlas/test"])
+        self.store.put("sources", "channels/preview.json", encoded(source))
+        report = build(self.store, "preview", self.pem, only_if_changed=True)
+        self.assertEqual(3, report["logical_textures"])
+        self.assertEqual(0, report["generated"])
+
+    def test_failed_build_does_not_mark_sources_complete(self):
+        with self.assertRaises(ValueError): build(self.store, "preview", self.pem, budget=1, only_if_changed=True)
+        self.assertIsNone(self.store.get("finished", "builds/preview.json"))
+        self.assertFalse(build(self.store, "preview", self.pem, only_if_changed=True).get("unchanged", False))
 
     def test_newer_printing_uses_verified_equivalent_provider_id(self):
         printing={"source_card_id":"me3-1","name":"Spinarak"}
