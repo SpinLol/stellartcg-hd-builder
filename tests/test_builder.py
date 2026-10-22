@@ -33,6 +33,39 @@ class Store:
 
 
 class BuilderTests(unittest.TestCase):
+    def test_product_faces_survive_export_and_remap_without_shared_texture_bleed(self):
+        import tempfile
+        from pathlib import Path
+        source = json.loads(self.store.get("sources", "channels/preview.json"))
+        for face, h in (("north", "a" * 64), ("south", "b" * 64)):
+            source["assets"][f"stellartcg:product/hd/41/{face}"] = {
+                "source": h, "mode": "fill", "trim": True, "minimum_dimension": 512,
+                "admin_upload": {"identity": f"stellartcg:custom/etb|0|{face}", "sha256": h}}
+        self.store.put("sources", "channels/preview.json", encoded(source))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "shared.png").write_bytes(self.original)
+            rows = {"stellartcg:product/shared": {"file": "shared.png", "mode": "stretch", "trim": False, "minimum_dimension": 512}}
+            templates = {f"stellartcg:product/hd/77/{face}": {"custom_product": f"stellartcg:custom/etb|0|{face}", "minimum_dimension": 512} for face in ("north", "south", "west")}
+            (root / "export.json").write_bytes(encoded({"format": 1, "content_hash": "new", "assets": rows, "product_uploads": templates}))
+            publish_sources(self.store, root / "export.json", "preview")
+        after = json.loads(self.store.get("sources", "channels/preview.json"))["assets"]
+        self.assertEqual("a" * 64, after["stellartcg:product/hd/77/north"]["source"])
+        self.assertEqual("b" * 64, after["stellartcg:product/hd/77/south"]["source"])
+        self.assertNotIn("stellartcg:product/hd/77/west", after)
+        self.assertNotIn("admin_upload", after["stellartcg:product/shared"])
+
+    def test_product_faces_keep_native_aspect_and_uv_atlas_keeps_padding(self):
+        source = Image.new("RGBA", (1200, 800))
+        source.paste((40, 150, 230, 255), (100, 100, 1100, 700))
+        out = io.BytesIO(); source.save(out, "PNG")
+        with Image.open(io.BytesIO(render(out.getvalue(), "fill", True))) as face:
+            self.assertEqual((1000, 600), face.size)
+        with Image.open(io.BytesIO(render(out.getvalue(), "stretch", False))) as atlas:
+            self.assertEqual((1200, 800), atlas.size)
+            self.assertEqual(0, atlas.getpixel((0, 0))[3])
+            self.assertEqual(255, atlas.getpixel((600, 400))[3])
+
     def test_source_export_preserves_custom_inbox_override_and_new_logical_ids(self):
         import tempfile
         from pathlib import Path
