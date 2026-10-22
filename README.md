@@ -10,7 +10,7 @@ There is no shared Stellar download service, tracking service or embedded creden
 3. A manually dispatched GitHub Actions workflow fetches higher-resolution scans of the exact configured printings from Pokémon TCG or TCGdex, checks their visual fingerprint against the existing art, and encodes WebP quality 95 at the scan's native resolution, capped at 2048. **Images are never enlarged.** Cards without an available matching higher-resolution scan keep standard artwork. Authored variant artwork is not replaced with another printing. Changed custom originals can also be used when already higher resolution. The workflow uses at most four image workers in memory. No large archive, Actions artifact or Actions cache is created.
 4. Once all objects exist, a signed catalog is published atomically. Interrupted builds leave the last published catalog usable. Progress checkpoints allow re-running to reuse completed work as well as unchanged objects from earlier publications. Removed logical textures disappear from the next catalog; historical blobs are retained for rollback rather than silently deleted.
 5. The Minecraft server advertises only the HTTPS catalog URL, public verification key and limits. **It never downloads, generates, stages or stores HD files.**
-6. Players opt in using `/tcgartwork`. Engine verifies the signed catalog, fetches only viewed textures directly from your domain, checks SHA-256, and uses a bounded disk cache plus the existing bounded GPU cache. Standard artwork remains the fallback.
+6. Engine 1.69.1 offers Standard or HD on joining until the player chooses HD. Players can also use `/tcgartwork`. Engine verifies the signed catalog and immediately installs the complete available HD library directly from your domain using at most four image workers, checking SHA-256. Standard artwork stays active until the download is complete. The saved preference and verified files are reused on later joins; only missing or changed images are fetched. Disk limits still apply to the whole installation, while decoded CPU/GPU textures remain bounded and load only when viewed.
 
 For example, a 733×1024 scan becomes a 1024-square canvas with transparent side borders, preserving its original pixels. It does not become an invented 2048 scan. Known equivalent Mega Evolution set IDs can fall back to TCGdex when the first provider lacks a scan; both the exact card name and visual fingerprint must match. A native 600×825 scan remains at that resolution. Product faces preserve the current UV/layout policy and upgrade only when an actually higher-resolution original is available. Automatically fitted product photos keep the already flattened face so HD does not undo perspective corrections. Card effects remain client GPU effects, not animated texture sheets. Provider requests allow only specific HTTPS artwork hosts, reject redirects and byte/pixel overflows, and validate both printing IDs and a visual fingerprint. Missing or mismatched scans are counted in `standard_fallbacks`; the workflow has a **retry missing scans** option.
 
@@ -24,6 +24,49 @@ For example, a 733×1024 scan becomes a 1024-square canvas with transparent side
 - Use Python 3.12 with `pip install -r requirements.txt` on your operator workstation. Set AWS credential environment variables for the R2 token. For a private repository, check your Actions allowance before a full build.
 
 ## Publish/update artwork
+
+### Automatic updates (StellarTCG 1.51.0+)
+
+Configure your own R2 credentials using `hd-upload.json` and `hd-upload-secrets.json` below.
+Set `enabled: true` and `auto_sync_content: true`. Once new cards/products are loaded
+by a successful content reload or restart and the standard artwork publication finishes,
+the mod automatically synchronizes the current logical texture catalog and required
+original images to your private source bucket. No export command, Python installation
+or manual source upload is needed on the server.
+
+Update your builder repository with this version of `builder.py`, its tests, and
+`.github/workflows/hd-artwork.yml`. The workflow checks the configured stable channel
+every 30 minutes and only builds a source revision that has not already been published.
+GitHub may delay scheduled runs. Configure repository variables `HD_AUTO_CHANNEL`
+(default `stable`) and `HD_MAXIMUM_STORAGE_GIB` (default `8`) if needed. GitHub can disable
+scheduled workflows on inactive public repositories; its Actions page allows re-enabling
+them. For prompt publication without depending on a schedule, enable `dispatch_workflow`
+and configure the optional repository-scoped Actions-write token.
+
+The default 30-second content debounce batches rapid edits. Originals stream one at a time
+through bounded RAM; fitted product faces are read from the existing standard ZIP chunks
+without extracting anything. The cloud computes reference fingerprints, finds exact
+official scans, encodes HD and signs the completed catalog. The Minecraft server never
+downloads, upscales, renders or stores HD outputs. Its `hd-sync-state.json` contains only
+file stamps, hashes and pending-build metadata. Regular content files are never deleted.
+Only verified custom inbox originals follow the existing inbox-removal policy.
+
+Unchanged source objects are reused, custom inbox overrides survive official catalog
+refreshes, interrupted uploads preserve the last usable HD catalog, and pending immediate
+build dispatches survive restarts. A single synchronization can upload at most
+`maximum_sync_upload_mib` (default 2048 MiB) of new originals; verified partial uploads are
+reused by retries. This is a per-sync safety limit; the cloud workflow still enforces its
+separate total bucket budget. Existing HD clients detect new catalogs automatically and
+download only missing/changed images; standard artwork remains available meanwhile.
+
+Commands (`stellartcg.admin.ops`):
+
+- `/tcg admin hdartwork status`: synchronization / publication status.
+- `/tcg admin hdartwork sync`: request a source synchronization immediately.
+- `/tcg admin hdartwork upload`: process inbox artwork and pending content changes.
+
+Set `auto_sync_content: false` to retain manual source publishing. The standalone
+workstation export procedure below remains supported.
 
 Run `/tcg admin hdartwork export` in game or in your server console. It writes **metadata only** to `config/stellartcg/hd-source-export.json`; there are no new image files and no resource-pack rebuild. Use the standalone Python publisher on a workstation with a copy of your TCG configuration, or run only its `sources` operation on the server to stream existing sources directly to R2. The `sources` operation never fetches high-resolution scans or renders images. High-resolution retrieval and generation happen exclusively in GitHub Actions.
 
@@ -61,7 +104,83 @@ Dispatch `stable`. Configure `config/stellartcg/hd-artwork.json`:
 }
 ```
 
-Use `/tcg admin hdartwork reload` (permission `stellartcg.admin.ops`) to advertise changes **without rebuilding or reloading the normal resource pack**. Engine 1.69.0+ is needed for optional HD; older clients retain their standard artwork. Each player must opt in independently.
+Use `/tcg admin hdartwork reload` (permission `stellartcg.admin.ops`) to advertise changes **without rebuilding or reloading the normal resource pack**. Engine 1.69.1+ provides first-join selection and complete-library installation; 1.69.0 used downloads when viewing. Older clients retain their standard artwork. Each player must opt in independently. The base pack remains necessary for models and images without a matching HD scan. Set `client_disk_cache_mib` large enough for the complete available HD library; the download screen reports required space when the configured limit is too low.
+
+## Optional custom-set upload inbox (TCG 1.49.0)
+
+Official scan lookup is unchanged. For a custom set only, an administrator can create
+`content/sets/<set-folder>/hd-artwork/` and place `001.png`, `002.jpg`, or `003.webp` inside it.
+The filename must match the card's local JSON `id` exactly, including leading zeros.
+The mod never creates these folders. Standard card fronts must remain outside this inbox.
+Use one static, genuinely higher-resolution front image per card; no enlargement is performed.
+The replacement covers that card's variants which use the same base front, preserving their finishes.
+Separate artwork assigned to a variant keeps its existing behavior.
+
+Configure `config/stellartcg/hd-upload.json` for **your own** private R2 source bucket:
+
+```json
+{
+  "enabled": true,
+  "account_id": "YOUR_32_CHARACTER_CLOUDFLARE_ACCOUNT_ID",
+  "source_bucket": "your-private-hd-source-bucket",
+  "channel": "stable",
+  "poll_seconds": 60,
+  "quiet_seconds": 20,
+  "maximum_upload_mib": 32,
+  "files_per_batch": 20,
+  "dispatch_workflow": false,
+  "auto_sync_content": true,
+  "sync_debounce_seconds": 30,
+  "maximum_sync_upload_mib": 2048,
+  "github_repository": "YOUR_NAME/YOUR_HD_BUILDER_REPOSITORY",
+  "github_workflow": "hd-artwork.yml",
+  "github_ref": "main"
+}
+```
+
+Keep credentials in `hd-upload-secrets.json` beside that config, **outside `content/`**:
+
+```json
+{
+  "AWS_ACCESS_KEY_ID": "YOUR_BUCKET_SCOPED_ACCESS_KEY",
+  "AWS_SECRET_ACCESS_KEY": "YOUR_BUCKET_SCOPED_SECRET",
+  "GITHUB_TOKEN": "OPTIONAL_FINE_GRAINED_ACTIONS_WRITE_TOKEN"
+}
+```
+
+Alternatively use `STELLARTCG_R2_ACCESS_KEY_ID`, `STELLARTCG_R2_SECRET_ACCESS_KEY` and
+`STELLARTCG_HD_GITHUB_TOKEN` environment variables. Restrict the R2 token to your private source
+bucket and the GitHub token to Actions write access on your builder repository. These secrets
+are never sent to players or included in generated packs; protect them and exclude them from
+shared configuration exports. The existing Actions signing key remains in GitHub Secrets.
+
+The mod checks only admin-created inboxes, waits for files to settle, validates each static
+image in bounded RAM, uploads its original bytes, downloads the remote object to verify its
+full SHA-256, conditionally merges the private source catalog, and verifies the committed
+mapping. Only then does it remove the corresponding local original. Files that change,
+fail, are too small, conflict or have unknown IDs are retained. Tiny metadata receipts in
+`hd-upload-receipts/` allow safe recovery after interruption; they contain no images or secrets.
+Keep an independent backup of your custom originals. No server HD pack or persistent image
+cache is created, and this process does not rebuild the normal resource pack.
+
+- `/tcg admin hdartwork upload` checks the inbox immediately, using the same quiet-file safeguard.
+- `/tcg admin hdartwork status` shows the upload status.
+- Both use `stellartcg.admin.ops` (or operator access).
+- Config changes are picked up automatically on the next poll or upload command.
+
+The uploaded original is stored safely before local deletion, but appears in players' HD
+library **after the GitHub cloud workflow publishes it**. With `dispatch_workflow: false`,
+run **Build HD artwork** manually for the configured channel. Set it to `true` and configure
+the optional GitHub token to queue the build after an upload batch. A failed dispatch leaves
+the originals safely in R2 and reports that the workflow must be run manually. Update the
+operator's `builder.py` when using source exports so future official uploads preserve custom
+overrides and concurrent inbox changes.
+
+Engine 1.69.3 also redraws standard and custom grading-company slab frames, edges and printed
+labels at higher resolution locally when the player's HD library is active. It preserves
+the existing design and transparent card window. This adds no slab images to R2 or the server
+pack. Standard-mode players retain the existing slab textures. Generated slab textures share
+the existing bounded visible-artwork cache and are generated off the render thread.
 
 ## Storage, cost and recovery
 

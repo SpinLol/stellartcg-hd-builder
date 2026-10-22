@@ -227,6 +227,34 @@ class R2:
             CacheControl="public,max-age=31536000,immutable" if immutable else "no-cache, max-age=0, must-revalidate",
             Metadata={"sha256": digest(data)}, StorageClass="STANDARD")
 
+    def snapshot(self, bucket, key):
+        from botocore.exceptions import ClientError
+        try:
+            r = self.s3.get_object(Bucket=bucket, Key=key)
+        except ClientError as error:
+            if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                return None, None
+            raise
+        with r["Body"] as stream:
+            if r["ContentLength"] > MAX_CATALOG:
+                raise ValueError("Source catalog exceeds limit")
+            data = stream.read(MAX_CATALOG + 1)
+        if len(data) > MAX_CATALOG:
+            raise ValueError("Source catalog exceeds limit")
+        return data, r["ETag"]
+
+    def conditional(self, bucket, key, data, etag):
+        from botocore.exceptions import ClientError
+        try:
+            self.s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/json",
+                CacheControl="no-cache, max-age=0, must-revalidate",
+                **({"IfMatch": etag} if etag else {"IfNoneMatch": "*"}))
+            return True
+        except ClientError as error:
+            if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
+                return False
+            raise
+
     def objects(self, bucket):
         result = {}
         for page in self.s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
@@ -289,16 +317,55 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
         rows[logical] = item
         if len(rows) % 500 == 0:
             print(json.dumps({"phase": "source_metadata", "processed": len(rows), "total": len(document["assets"]), "new_originals": uploaded}), flush=True)
-    catalog = {"format": 1, "policy": POLICY, "content_hash": document["content_hash"], "assets": rows}
-    data = encoded(catalog)
-    if len(data) > MAX_CATALOG:
-        raise ValueError("Source catalog exceeds limit")
-    store.put(store.sources, f"channels/{channel(name)}.json", data)
+    key = f"channels/{channel(name)}.json"
+    for attempt in range(5):
+        old, etag = store.snapshot(store.sources, key)
+        previous = json.loads(old) if old else {"assets": {}}
+        # Explicit custom uploads survive future official-source exports, including changed logical IDs.
+        custom = {r["admin_upload"]["card"]: r for r in previous["assets"].values()
+                  if r.get("admin_upload", {}).get("card")}
+        merged = dict(rows)
+        for logical, previous_row in previous["assets"].items():
+            if previous_row.get("admin_upload") and logical not in merged:
+                merged[logical] = previous_row  # An older export cannot silently discard a new custom set.
+        for logical, row in rows.items():
+            manual = previous["assets"].get(logical, {})
+            card = document["assets"].get(logical, {}).get("custom_card")
+            if card in custom:
+                manual = custom[card]
+            if manual.get("admin_upload"):
+                merged[logical] = dict(manual, minimum_dimension=row["minimum_dimension"])
+        catalog = {"format": 1, "policy": POLICY, "content_hash": document["content_hash"], "assets": merged}
+        data = encoded(catalog)
+        if len(data) > MAX_CATALOG:
+            raise ValueError("Source catalog exceeds limit")
+        if store.conditional(store.sources, key, data, etag):
+            break
+    else:
+        raise ValueError("Concurrent HD inbox updates; source export retained for retry")
     print(json.dumps({"source_textures": len(rows), "new_originals": uploaded, "source_catalog_sha256": digest(data)}))
 
 
 def prepare_asset(store, row):
     """One bounded worker: fetch and encode in RAM; the coordinator alone publishes."""
+    # The server uploads a bounded original reference, never decodes or fetches HD.
+    # Compute precisely the same Pillow fingerprint used by the workstation publisher.
+    if row.get("printing"):
+        row = dict(row)
+        printing = row["printing"]
+        url = printing_url(printing)
+        if url:
+            reference_hash = row.get("reference_source", "")
+            if not HASH.fullmatch(reference_hash):
+                raise ValueError("Invalid original fingerprint reference")
+            reference = store.get(store.sources, f"sources/{reference_hash}", MAX_SOURCE)
+            if reference is None or digest(reference) != reference_hash:
+                raise ValueError("Missing or corrupt fingerprint reference; published HD unchanged")
+            row.update(remote=url, printing_id=printing["source_card_id"],
+                       reference_dhash=artwork_signature(reference)[0])
+            alternative = alternate_printing(printing)
+            if alternative:
+                row["alternate"] = alternative
     original = None
     if row.get("remote"):
         try:
@@ -317,13 +384,20 @@ def prepare_asset(store, row):
     return {"sha256": digest(image), "bytes": len(image), "width": dimensions[0], "height": dimensions[1]}, image
 
 
-def build(store, name, signing_key, budget=8 << 30, retry_missing=False, workers=4):
+def build(store, name, signing_key, budget=8 << 30, retry_missing=False, workers=4, only_if_changed=False):
     source = store.get(store.sources, f"channels/{channel(name)}.json")
     if source is None:
         raise ValueError("Upload a source catalog first")
     data = json.loads(source)
     if data.get("format") != 1 or data.get("policy") != POLICY or len(data["assets"]) > 200000:
         raise ValueError("Unsupported source catalog")
+    source_revision = digest(source)
+    if only_if_changed and not retry_missing:
+        completed = store.get(store.output, f"builds/{name}.json", 1 << 20)
+        if completed and json.loads(completed).get("source_revision") == source_revision:
+            report = {"channel": name, "unchanged": True, "source_revision": source_revision}
+            print(json.dumps(report))
+            return report
     private = serialization.load_pem_private_key(signing_key.encode(), password=None)
     if not isinstance(private, Ed25519PrivateKey):
         raise ValueError("Expected an Ed25519 signing key")
@@ -409,6 +483,8 @@ def build(store, name, signing_key, budget=8 << 30, retry_missing=False, workers
     if old and old != envelope:
         store.put(store.output, f"channels/{name}-previous.json", old)
     store.put(store.output, f"channels/{name}.json", envelope)
+    # Written after atomic publication only: interrupted builds remain retryable.
+    store.put(store.output, f"builds/{name}.json", encoded({"source_revision": source_revision, "revision": revision}))
     report = {"logical_textures": len(assets), "generated": generated, "reused": reused, "standard_fallbacks": skipped,
               "unique_hd_bytes": sum(existing.get(k, 0) for k in {f"objects/{a['sha256']}.webp" for a in assets.values()}),
               "combined_bucket_bytes": used, "revision": revision, "channel": name}
@@ -429,6 +505,7 @@ def main():
     parser.add_argument("--source-export")
     parser.add_argument("--content-root", help="Override the exported server config root, for a copied content directory")
     parser.add_argument("--retry-missing", action="store_true", help="Recheck provider scans that were unavailable or rejected previously")
+    parser.add_argument("--only-if-changed", action="store_true", help="Skip scheduled checks when the source channel was already published successfully")
     parser.add_argument("--workers", type=int, default=4, choices=range(1,5))
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--maximum-storage-gib", type=float, default=8)
@@ -449,7 +526,7 @@ def main():
     if args.operation == "sources":
         publish_sources(store, args.source_export, args.channel, args.limit, budget, args.content_root)
     else:
-        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget, args.retry_missing, args.workers)
+        build(store, args.channel, os.environ["HD_SIGNING_KEY"], budget, args.retry_missing, args.workers, args.only_if_changed)
 
 
 if __name__ == "__main__":
