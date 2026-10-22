@@ -37,6 +37,7 @@ or manual source upload is needed on the server.
 Update your builder repository with this version of `builder.py`, its tests, and
 `.github/workflows/hd-artwork.yml`. The workflow checks the configured stable channel
 every 30 minutes and only builds a source revision that has not already been published.
+Builder recipe or test updates on `main` also run verification and the same incremental check.
 GitHub may delay scheduled runs. Configure repository variables `HD_AUTO_CHANNEL`
 (default `stable`) and `HD_MAXIMUM_STORAGE_GIB` (default `8`) if needed. GitHub can disable
 scheduled workflows on inactive public repositories; its Actions page allows re-enabling
