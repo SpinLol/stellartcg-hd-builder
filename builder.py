@@ -322,19 +322,23 @@ def publish_sources(store, file, name, limit=0, budget=8 << 30, content_root=Non
         old, etag = store.snapshot(store.sources, key)
         previous = json.loads(old) if old else {"assets": {}}
         # Explicit custom uploads survive future official-source exports, including changed logical IDs.
-        custom = {r["admin_upload"]["card"]: r for r in previous["assets"].values()
+        custom = {"card:" + r["admin_upload"]["card"]: r for r in previous["assets"].values()
                   if r.get("admin_upload", {}).get("card")}
+        custom.update({"product:" + r["admin_upload"]["identity"]: r for r in previous["assets"].values()
+                       if r.get("admin_upload", {}).get("identity")})
         merged = dict(rows)
         for logical, previous_row in previous["assets"].items():
             if previous_row.get("admin_upload") and logical not in merged:
                 merged[logical] = previous_row  # An older export cannot silently discard a new custom set.
-        for logical, row in rows.items():
+        assignments = dict(document["assets"])
+        assignments.update(document.get("product_uploads", {}))
+        for logical, spec in assignments.items():
             manual = previous["assets"].get(logical, {})
-            card = document["assets"].get(logical, {}).get("custom_card")
-            if card in custom:
-                manual = custom[card]
+            identity = "product:" + spec["custom_product"] if spec.get("custom_product") else "card:" + spec.get("custom_card", "")
+            if identity in custom:
+                manual = custom[identity]
             if manual.get("admin_upload"):
-                merged[logical] = dict(manual, minimum_dimension=row["minimum_dimension"])
+                merged[logical] = dict(manual, minimum_dimension=spec["minimum_dimension"])
         catalog = {"format": 1, "policy": POLICY, "content_hash": document["content_hash"], "assets": merged}
         data = encoded(catalog)
         if len(data) > MAX_CATALOG:
