@@ -10,7 +10,7 @@ There is no shared Stellar download service, tracking service or embedded creden
 3. A manually dispatched GitHub Actions workflow fetches higher-resolution scans of the exact configured printings from Pokémon TCG or TCGdex, checks their visual fingerprint against the existing art, and encodes WebP quality 95 at the scan's native resolution, capped at 2048. **Images are never enlarged.** Cards without an available matching higher-resolution scan keep standard artwork. Authored variant artwork is not replaced with another printing. Changed custom originals can also be used when already higher resolution. The workflow uses at most four image workers in memory. No large archive, Actions artifact or Actions cache is created.
 4. Once all objects exist, a signed catalog is published atomically. Interrupted builds leave the last published catalog usable. Progress checkpoints allow re-running to reuse completed work as well as unchanged objects from earlier publications. Removed logical textures disappear from the next catalog; historical blobs are retained for rollback rather than silently deleted.
 5. The Minecraft server advertises only the HTTPS catalog URL, public verification key and limits. **It never downloads, generates, stages or stores HD files.**
-6. Engine 1.69.1 offers Standard or HD on joining until the player chooses HD. Players can also use `/tcgartwork`. Engine verifies the signed catalog and immediately installs the complete available HD library directly from your domain using at most four image workers, checking SHA-256. Standard artwork stays active until the download is complete. The saved preference and verified files are reused on later joins; only missing or changed images are fetched. Disk limits still apply to the whole installation, while decoded CPU/GPU textures remain bounded and load only when viewed.
+6. Engine 1.71.0 defaults to Standard without interrupting joining players. Players switch to HD or back to Standard with `/tcgartwork`; existing saved preferences remain effective. Engine verifies the signed catalog and immediately installs the complete available HD library directly from your domain using at most four image workers, checking SHA-256. Standard artwork stays active until the download is complete. The saved preference and verified files are reused on later joins; only missing or changed images are fetched. Disk limits still apply to the whole installation, while decoded CPU/GPU textures remain bounded and load only when viewed. Both download progress displays use grayscale card backs that fill with color according to the transfer percentage.
 
 For example, a 733×1024 scan becomes a 1024-square canvas with transparent side borders, preserving its original pixels. It does not become an invented 2048 scan. Known equivalent Mega Evolution set IDs can fall back to TCGdex when the first provider lacks a scan; both the exact card name and visual fingerprint must match. A native 600×825 scan remains at that resolution. Product faces preserve the current UV/layout policy and upgrade only when an actually higher-resolution original is available. Automatically fitted product photos keep the already flattened face so HD does not undo perspective corrections. Card effects remain client GPU effects, not animated texture sheets. Provider requests allow only specific HTTPS artwork hosts, reject redirects and byte/pixel overflows, and validate both printing IDs and a visual fingerprint. Missing or mismatched scans are counted in `standard_fallbacks`; the workflow has a **retry missing scans** option.
 
@@ -105,7 +105,7 @@ Dispatch `stable`. Configure `config/stellartcg/hd-artwork.json`:
 }
 ```
 
-Use `/tcg admin hdartwork reload` (permission `stellartcg.admin.ops`) to advertise changes **without rebuilding or reloading the normal resource pack**. Engine 1.69.1+ provides first-join selection and complete-library installation; 1.69.0 used downloads when viewing. Older clients retain their standard artwork. Each player must opt in independently. The base pack remains necessary for models and images without a matching HD scan. Set `client_disk_cache_mib` large enough for the complete available HD library; the download screen reports required space when the configured limit is too low.
+Use `/tcg admin hdartwork reload` (permission `stellartcg.admin.ops`) to advertise changes **without rebuilding or reloading the normal resource pack**. Engine 1.71.0+ uses `/tcgartwork` for manual selection and complete-library installation, with no join-time popup. Versions 1.69.1–1.70.0 offered first-join selection; 1.69.0 used downloads when viewing. Older clients retain their standard artwork. Each player must opt in independently. The base pack remains necessary for models and images without a matching HD scan. Set `client_disk_cache_mib` large enough for the complete available HD library; the download screen reports required space when the configured limit is too low.
 
 ## Optional custom-set upload inbox (TCG 1.49.0)
 
@@ -184,6 +184,21 @@ pack. Standard-mode players retain the existing slab textures. Generated slab te
 the existing bounded visible-artwork cache and are generated off the render thread.
 
 ## Storage, cost and recovery
+
+### Optional HD product previews and 3D faces
+
+TCG 1.52.0 and Engine 1.72.0 extend the same inbox to product artwork. See
+`HD_CUSTOM_ARTWORK.md` in the mod distribution for full examples. Place images in
+`content/sets/<set>/hd-artwork/products/<product-id>/` using `main`, `front`, `back`,
+`sides` (or `left` and `right`), `top`, `bottom`, and `model` for complete UV atlases.
+An optional `wrapper-2/` subfolder addresses the second wrapper.
+
+Source exports contain `product_uploads` metadata templates, not extra default images.
+The builder preserves explicit uploads by product ID, wrapper and face across future
+source refreshes. Product faces use independent aliases, so shared standard image hashes
+cannot accidentally replace other faces or products. There is no separate R2 setup,
+new workflow input or product-specific credential. The normal signed, incremental WebP95
+cloud build publishes these uploads alongside cards.
 
 The workflow's default safety budget is **8 GiB combined across the two configured buckets**, including existing historical files. This is a software guard, not an account-wide billing cap. Set it deliberately before expanding the library. R2's free allocation is shared with other buckets and includes request limits. Source uploads and unchanged builds reuse data, but storage and requests beyond your account allowance can still cost money. Existing remote scans are reused through the build index; unavailable printings are not constantly re-fetched unless the admin requests a retry. There is no synthetic activity, scheduled keepalive or full-library client redownload.
 
