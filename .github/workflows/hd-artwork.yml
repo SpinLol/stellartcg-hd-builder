@@ -1,5 +1,7 @@
 name: Build HD artwork
 on:
+  schedule:
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       channel:
@@ -33,8 +35,8 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       HD_SIGNING_KEY: ${{ secrets.HD_SIGNING_KEY }}
-      BUILD_CHANNEL: ${{ inputs.channel }}
-      STORAGE_BUDGET: ${{ inputs.maximum_storage_gib }}
+      BUILD_CHANNEL: ${{ inputs.channel || vars.HD_AUTO_CHANNEL || 'stable' }}
+      STORAGE_BUDGET: ${{ inputs.maximum_storage_gib || vars.HD_MAXIMUM_STORAGE_GIB || '8' }}
       RETRY_MISSING: ${{ inputs.retry_missing_scans }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -50,5 +52,5 @@ jobs:
           if [ "$RETRY_MISSING" = "true" ]; then
             python builder.py build --channel "$BUILD_CHANNEL" --maximum-storage-gib "$STORAGE_BUDGET" --retry-missing
           else
-            python builder.py build --channel "$BUILD_CHANNEL" --maximum-storage-gib "$STORAGE_BUDGET"
+            python builder.py build --channel "$BUILD_CHANNEL" --maximum-storage-gib "$STORAGE_BUDGET" --only-if-changed
           fi
